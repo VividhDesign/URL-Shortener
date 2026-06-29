@@ -13,7 +13,9 @@ const {apiLimiter} = require('./middleware/rateLimiter');
 const allowedOrigins = [
     'http://localhost:5173',
     'http://localhost:5174',
-    process.env.FRONTEND_URL, // set this to your Vercel URL on Render
+    'https://url-shortener-peach-five.vercel.app',
+    'https://url-shortener-git-main-vividhdesigns-projects.vercel.app',
+    process.env.FRONTEND_URL,
 ].filter(Boolean);
 
 app.use(cors({
