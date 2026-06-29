@@ -1,0 +1,119 @@
+# 🗺️ URL Shortener — Complete Project Roadmap
+
+> **Who is this for?** Someone who wants to *build and understand* every line — not just copy-paste.
+> **Goal:** A production-grade URL Shortener with Redis caching, analytics, and live deployment.
+
+---
+
+## 📦 What You'll Build (The Final Product)
+
+```
+User pastes a long URL → Gets a short link (e.g., short.ly/abc123)
+Anyone clicks that link → Gets redirected to the original URL
+Dashboard shows: How many clicks? From which country? Which device?
+```
+
+### Feature List
+| Feature | What it does | Why it matters |
+|---|---|---|
+| Short code generation | Converts long URL → 6-char code | Core logic |
+| 301 vs 302 redirect | Browser redirect types | HTTP knowledge |
+| Rate limiting | Max 10 requests/minute per IP | Production thinking |
+| Click analytics | Tracks geo, device, time | Data pipeline |
+| Redis caching | Stores hot links in memory | Performance |
+| MongoDB TTL indexes | Auto-deletes expired links | DB-level features |
+| REST API | Clean endpoints | Standard backend |
+
+---
+
+## 🗓️ Your Learning Path (7 Phases)
+
+```
+Phase 0 → Setup & Understanding
+Phase 1 → Database Design (MongoDB)
+Phase 2 → Core API (Express + shortcode logic)
+Phase 3 → Redis Caching
+Phase 4 → Analytics Pipeline
+Phase 5 → Rate Limiting
+Phase 6 → Frontend Dashboard
+Phase 7 → Deployment (Render + Vercel)
+```
+
+---
+
+## 📁 Final Folder Structure (You'll build this piece by piece)
+
+```
+url-shortener/
+│
+├── server/                    ← Backend (Node.js + Express)
+│   ├── config/
+│   │   ├── db.js              ← MongoDB connection
+│   │   └── redis.js           ← Redis connection
+│   │
+│   ├── models/
+│   │   └── Url.js             ← MongoDB Schema
+│   │
+│   ├── routes/
+│   │   ├── url.routes.js      ← /shorten, /:code routes
+│   │   └── analytics.routes.js← /analytics/:code
+│   │
+│   ├── controllers/
+│   │   ├── url.controller.js  ← Business logic
+│   │   └── analytics.controller.js
+│   │
+│   ├── middleware/
+│   │   └── rateLimiter.js     ← Rate limiting
+│   │
+│   ├── utils/
+│   │   └── shortCode.js       ← Base62 encoder
+│   │
+│   └── index.js               ← Entry point
+│
+├── client/                    ← Frontend (HTML/CSS/JS or React)
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+│
+├── .env                       ← Secrets (never push to GitHub!)
+├── .gitignore
+├── package.json
+└── README.md
+```
+
+---
+
+## 🛠️ Tech Stack — Why Each Tool?
+
+| Tool | Why We Use It |
+|---|---|
+| **Node.js** | JavaScript on the server — fast, non-blocking |
+| **Express.js** | Minimal web framework — handle routes easily |
+| **MongoDB** | Stores URLs, analytics — flexible schema |
+| **Mongoose** | ODM — makes MongoDB easy to use in Node |
+| **Redis** | In-memory cache — super fast lookups |
+| **nanoid** | Generates unique short codes |
+| **express-rate-limit** | Prevents API abuse |
+| **geoip-lite** | Converts IP → Country |
+| **ua-parser-js** | Parses User-Agent → Device type |
+
+---
+
+## 📚 Artifacts Index (Read in Order)
+
+| Artifact | Topic |
+|---|---|
+| **01_setup.md** | Phase 0: Install tools, init project |
+| **02_mongodb_design.md** | Phase 1: Schema design, why these fields |
+| **03_core_api.md** | Phase 2: Express routes, shortcode logic |
+| **04_redis_caching.md** | Phase 3: What is Redis, how to integrate |
+| **05_analytics.md** | Phase 4: Track clicks, geo, device |
+| **06_rate_limiting.md** | Phase 5: Protect your API |
+| **07_frontend.md** | Phase 6: Simple dashboard |
+| **08_deployment.md** | Phase 7: Deploy to Render + Vercel |
+
+---
+
+> [!IMPORTANT]
+> Read each artifact fully before coding. Understand *why* before *how*.
+> After each phase, test your code before moving to the next phase.

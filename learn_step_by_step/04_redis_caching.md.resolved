@@ -1,0 +1,429 @@
+# 🔴 Phase 3 — Redis Caching
+
+> **Goal:** Add Redis to make URL lookups ultra-fast.
+> **Time Estimate:** 1.5 hours
+> **Skills Learned:** Redis, caching strategy, cache-aside pattern, cache invalidation
+
+---
+
+## Why Redis? The Real-World Problem
+
+Without caching, **every** click on a short URL causes:
+```
+User clicks → Express → MongoDB query (disk read) → Express → Redirect
+             ~5ms wait    ~10-50ms wait             instant
+```
+
+A popular link might get **10,000 clicks per minute**.
+That's 10,000 MongoDB queries per minute — slow and expensive.
+
+With Redis:
+```
+User clicks → Express → Redis lookup (RAM) → Express → Redirect
+                        ~0.1ms wait
+```
+> For hot links (clicked often), Redis serves them from RAM instantly.
+> MongoDB is only hit once — when the link is first accessed.
+
+---
+
+## The Cache-Aside Pattern
+
+This is the most common caching strategy. Here's how it works:
+
+```
+1. User requests short code "aB3xYz"
+2. Check Redis: Does it exist in cache?
+   → YES (cache hit):  Return from Redis immediately. Done!
+   → NO (cache miss):  Go to MongoDB, get the data, store in Redis, return to user.
+3. Next time same code is requested → Cache hit → Instant response!
+```
+
+```
+First request:                   Subsequent requests:
+User → Redis (miss) → MongoDB    User → Redis (hit) → Done!
+                ↓
+           Store in Redis
+```
+
+---
+
+## Step 1: Create Redis Connection
+
+Create `server/config/redis.js`:
+
+```javascript
+// server/config/redis.js
+
+const Redis = require('ioredis');
+
+let client;
+
+const connectRedis = () => {
+  // If using Upstash (cloud Redis), REDIS_URL looks like:
+  // redis://default:password@host:port
+  // If using local Redis:
+  // redis://localhost:6379
+  
+  client = new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
+    // Retry strategy: how long to wait between reconnect attempts
+    retryStrategy(times) {
+      // Wait 2 seconds between retries, max 10 retries
+      if (times > 10) return null; // Stop retrying after 10 attempts
+      return Math.min(times * 200, 2000); // Wait 200ms, 400ms, 600ms...
+    },
+    // Don't crash if Redis is unavailable — just log the error
+    lazyConnect: true,
+  });
+
+  client.on('connect', () => {
+    console.log('✅ Redis Connected');
+  });
+
+  client.on('error', (err) => {
+    // Log the error but don't crash the server
+    // App should still work without Redis (just slower)
+    console.error('❌ Redis Error:', err.message);
+  });
+
+  return client;
+};
+
+// Singleton pattern: only one Redis connection across the whole app
+const getRedisClient = () => {
+  if (!client) {
+    connectRedis();
+  }
+  return client;
+};
+
+module.exports = { connectRedis, getRedisClient };
+```
+
+---
+
+## Step 2: Add Redis Connection in index.js
+
+Update `server/index.js`:
+
+```javascript
+// server/index.js
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const connectDB = require('./config/db');
+const { connectRedis } = require('./config/redis');   // ← ADD
+const urlRoutes = require('./routes/url.routes');
+const { redirectUrl } = require('./controllers/url.controller');
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// Connect to databases
+connectDB();
+connectRedis();   // ← ADD
+
+app.use('/api', urlRoutes);
+app.get('/:code', redirectUrl);
+app.get('/', (req, res) => {
+  res.json({ message: 'URL Shortener API is running! 🚀' });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+```
+
+---
+
+## Step 3: Update the Controller with Caching
+
+Update `server/controllers/url.controller.js` — modify `redirectUrl` and `shortenUrl`:
+
+```javascript
+// server/controllers/url.controller.js
+
+const Url = require('../models/Url');
+const Analytics = require('../models/Analytics');
+const { generateShortCode } = require('../utils/shortCode');
+const { getRedisClient } = require('../config/redis');   // ← ADD
+const geoip = require('geoip-lite');
+const UAParser = require('ua-parser-js');
+
+const CACHE_TTL = 60 * 60 * 24;   // 24 hours in seconds
+
+// ─────────────────────────────────────────────────────────
+// Helper: Get URL from cache or database
+// ─────────────────────────────────────────────────────────
+const getUrlFromCacheOrDB = async (shortCode) => {
+  const redis = getRedisClient();
+  const cacheKey = `url:${shortCode}`;
+
+  try {
+    // Step 1: Try Redis first
+    const cached = await redis.get(cacheKey);
+    
+    if (cached) {
+      // Cache hit! Parse the JSON string back to object
+      console.log(`🔴 Cache HIT for ${shortCode}`);
+      return JSON.parse(cached);
+    }
+  } catch (redisErr) {
+    // If Redis is down, continue to MongoDB (graceful degradation)
+    console.error('Redis get failed, falling back to DB:', redisErr.message);
+  }
+
+  // Step 2: Cache miss — get from MongoDB
+  console.log(`🟡 Cache MISS for ${shortCode} — querying MongoDB`);
+  const urlDoc = await Url.findOne({ shortCode, isActive: true });
+
+  if (urlDoc) {
+    try {
+      // Step 3: Store in Redis for next time
+      // JSON.stringify converts object to string (Redis only stores strings)
+      await redis.setex(
+        cacheKey,           // key
+        CACHE_TTL,          // TTL in seconds (24 hours)
+        JSON.stringify(urlDoc)   // value
+      );
+      console.log(`✅ Cached ${shortCode} in Redis`);
+    } catch (redisErr) {
+      console.error('Redis set failed:', redisErr.message);
+    }
+  }
+
+  return urlDoc;
+};
+
+// ─────────────────────────────────────────────────────────
+// POST /api/shorten (same as before — no changes needed)
+// ─────────────────────────────────────────────────────────
+const isValidUrl = (url) => {
+  try {
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const shortenUrl = async (req, res) => {
+  const { longUrl, expiresInDays } = req.body;
+
+  if (!longUrl) return res.status(400).json({ error: 'longUrl is required' });
+  if (!isValidUrl(longUrl)) return res.status(400).json({ error: 'Invalid URL format' });
+
+  try {
+    const existing = await Url.findOne({ longUrl, isActive: true });
+    if (existing) {
+      return res.status(200).json({
+        message: 'URL already shortened',
+        shortUrl: existing.shortUrl,
+        shortCode: existing.shortCode,
+      });
+    }
+
+    let shortCode;
+    let isUnique = false;
+    let attempts = 0;
+
+    while (!isUnique && attempts < 10) {
+      shortCode = generateShortCode();
+      const exists = await Url.findOne({ shortCode });
+      if (!exists) isUnique = true;
+      attempts++;
+    }
+
+    if (!isUnique) return res.status(500).json({ error: 'Could not generate unique code' });
+
+    let expiresAt = null;
+    if (expiresInDays && expiresInDays > 0) {
+      expiresAt = new Date();
+      expiresAt.setDate(expiresAt.getDate() + parseInt(expiresInDays));
+    }
+
+    const shortUrl = `${process.env.BASE_URL}/${shortCode}`;
+    const urlDoc = new Url({ longUrl, shortCode, shortUrl, expiresAt });
+    await urlDoc.save();
+
+    return res.status(201).json({ message: 'URL shortened successfully!', shortUrl, shortCode, longUrl, expiresAt });
+
+  } catch (error) {
+    console.error('Error in shortenUrl:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// GET /:code — NOW WITH CACHING
+// ─────────────────────────────────────────────────────────
+const redirectUrl = async (req, res) => {
+  const { code } = req.params;
+
+  try {
+    // Use our cache-aware helper instead of direct DB query
+    const urlDoc = await getUrlFromCacheOrDB(code);
+
+    if (!urlDoc) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    if (urlDoc.expiresAt && new Date() > new Date(urlDoc.expiresAt)) {
+      return res.status(410).json({ error: 'This link has expired' });
+    }
+
+    // Update click count in DB (Redis count is not updated — that's fine)
+    await Url.findOneAndUpdate({ shortCode: code }, { $inc: { clicks: 1 } });
+
+    // Record analytics asynchronously
+    recordAnalytics(code, req).catch(err => console.error('Analytics error:', err));
+
+    return res.redirect(302, urlDoc.longUrl);
+
+  } catch (error) {
+    console.error('Error in redirectUrl:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// Helper to invalidate (delete) cache for a code
+// Call this when a URL is disabled or updated
+// ─────────────────────────────────────────────────────────
+const invalidateCache = async (shortCode) => {
+  try {
+    const redis = getRedisClient();
+    await redis.del(`url:${shortCode}`);
+    console.log(`🗑️ Cache invalidated for ${shortCode}`);
+  } catch (err) {
+    console.error('Cache invalidation failed:', err.message);
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// Analytics helper (same as before)
+// ─────────────────────────────────────────────────────────
+const recordAnalytics = async (shortCode, req) => {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+  const geo = geoip.lookup(ip);
+  const ua = req.headers['user-agent'] || '';
+  const parser = new UAParser(ua);
+  const result = parser.getResult();
+
+  let device = 'desktop';
+  if (result.device.type === 'mobile') device = 'mobile';
+  else if (result.device.type === 'tablet') device = 'tablet';
+
+  const analyticsDoc = new Analytics({
+    shortCode,
+    ipAddress: ip,
+    country: geo ? geo.country : 'Unknown',
+    city: geo ? geo.city : 'Unknown',
+    device,
+    browser: result.browser.name || 'unknown',
+    os: result.os.name || 'unknown',
+    referrer: req.headers.referer || 'direct',
+  });
+
+  await analyticsDoc.save();
+};
+
+const getUrlInfo = async (req, res) => {
+  const { code } = req.params;
+  try {
+    const urlDoc = await Url.findOne({ shortCode: code });
+    if (!urlDoc) return res.status(404).json({ error: 'Short URL not found' });
+    return res.status(200).json(urlDoc);
+  } catch (error) {
+    return res.status(500).json({ error: 'Server error' });
+  }
+};
+
+module.exports = { shortenUrl, redirectUrl, getUrlInfo, invalidateCache };
+```
+
+---
+
+## Step 4: Test Caching
+
+Run `npm run dev` and watch your terminal.
+
+**First click on a short URL:**
+```
+🟡 Cache MISS for aB3xYz — querying MongoDB
+✅ Cached aB3xYz in Redis
+```
+
+**Second click on same URL:**
+```
+🔴 Cache HIT for aB3xYz
+```
+
+The second click **didn't touch MongoDB at all**! That's the power of caching.
+
+---
+
+## Understanding Redis Commands
+
+| Command | What it does |
+|---|---|
+| `redis.get(key)` | Get value (returns null if not found) |
+| `redis.set(key, value)` | Store value (no expiry) |
+| `redis.setex(key, ttl, value)` | Store value with expiry time |
+| `redis.del(key)` | Delete a key |
+| `redis.exists(key)` | Check if key exists (returns 1 or 0) |
+
+**To manually inspect Redis:**
+```bash
+# Using redis-cli (if installed locally)
+redis-cli
+> KEYS *              # See all cached keys
+> GET url:aB3xYz     # See cached value for a code
+> TTL url:aB3xYz     # See how many seconds left before expiry
+```
+
+---
+
+## Cache Invalidation (When to Delete Cache)
+
+The hardest problem in caching is knowing when to invalidate.
+
+**Delete cache when:**
+1. A URL is disabled (`isActive = false`)
+2. The long URL is updated
+3. The URL expires
+
+**You don't need to delete cache for:**
+- Click count changes (minor inconsistency is acceptable)
+- Analytics (stored separately)
+
+---
+
+## ✅ Phase 3 Checklist
+
+- [ ] `server/config/redis.js` created
+- [ ] Redis connected in `index.js`
+- [ ] `getUrlFromCacheOrDB()` helper written
+- [ ] `redirectUrl` uses cache-aware helper
+- [ ] Test: First click → "Cache MISS" in console
+- [ ] Test: Second click → "Cache HIT" in console
+- [ ] Try: Kill Redis, confirm app still works (fallback to MongoDB)
+
+---
+
+> [!TIP]
+> **Graceful Degradation:** Notice how we catch Redis errors and fall back to MongoDB.
+> This means even if Redis crashes, your app keeps working. 
+> This is called **resilience** — a production-ready pattern!
+
+> [!NOTE]
+> **Interview Q:** "Why not cache everything in Redis?"
+> **Answer:** Redis runs in RAM which is expensive. We cache only frequently-accessed data (hot links). Rarely-accessed links stay in MongoDB only.
+
+---
+
+**➡️ Next: Phase 4 — Analytics API (`05_analytics.md`)**

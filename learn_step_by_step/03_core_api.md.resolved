@@ -1,0 +1,458 @@
+# ⚡ Phase 2 — Core API (Shorten + Redirect)
+
+> **Goal:** Build the two most important endpoints — shorten a URL, and redirect when clicked.
+> **Time Estimate:** 2-3 hours
+> **Skills Learned:** REST API design, Base62 encoding, collision handling, HTTP redirects
+
+---
+
+## The Two Core Endpoints
+
+```
+POST /api/shorten     ← User sends long URL, gets back short URL
+GET  /:code           ← User visits short URL, gets redirected to long URL
+```
+
+These two endpoints are the ENTIRE functionality of a URL shortener.
+Everything else (analytics, caching, rate limiting) is built ON TOP of these.
+
+---
+
+## Step 1: The Short Code Generator (Base62)
+
+This is the **most important utility** in the whole project.
+
+Create `server/utils/shortCode.js`:
+
+```javascript
+// server/utils/shortCode.js
+
+// Base62 alphabet: numbers + lowercase + uppercase = 62 characters
+// Why 62? Because 62^6 = 56 BILLION possible combinations
+// So even with millions of URLs, collisions are extremely rare
+const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const CODE_LENGTH = 6;
+
+/**
+ * Generates a random 6-character Base62 string
+ * Example outputs: "aB3xYz", "7KpQrM", "00zX9L"
+ */
+const generateShortCode = () => {
+  let code = '';
+  
+  for (let i = 0; i < CODE_LENGTH; i++) {
+    // Math.random() → random decimal between 0 and 1
+    // * ALPHABET.length → random decimal between 0 and 62
+    // Math.floor() → round down to integer (0-61)
+    // ALPHABET[...] → pick that character
+    const randomIndex = Math.floor(Math.random() * ALPHABET.length);
+    code += ALPHABET[randomIndex];
+  }
+  
+  return code;
+};
+
+module.exports = { generateShortCode };
+```
+
+**❓ Why Base62?**
+
+Think about how many combinations are possible:
+```
+Using only numbers (Base10): 10^6 = 1,000,000 combinations
+Using Base62:                 62^6 = 56,800,235,584 combinations (~56 billion!)
+```
+More characters in the alphabet = shorter codes for the same number of combinations.
+
+**❓ What is a collision?**
+> A collision happens when two different URLs get the same short code.
+> Since we're using random generation, it CAN happen (though rarely).
+> We'll handle this in the controller.
+
+---
+
+## Step 2: URL Controller (Business Logic)
+
+Create `server/controllers/url.controller.js`:
+
+```javascript
+// server/controllers/url.controller.js
+
+const Url = require('../models/Url');
+const Analytics = require('../models/Analytics');
+const { generateShortCode } = require('../utils/shortCode');
+const geoip = require('geoip-lite');
+const UAParser = require('ua-parser-js');
+
+// ─────────────────────────────────────────────────────────
+// Helper: Validate URL format
+// ─────────────────────────────────────────────────────────
+const isValidUrl = (url) => {
+  try {
+    // URL constructor throws an error if the URL is invalid
+    new URL(url);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// POST /api/shorten
+// Body: { longUrl, expiresInDays (optional) }
+// ─────────────────────────────────────────────────────────
+const shortenUrl = async (req, res) => {
+  const { longUrl, expiresInDays } = req.body;
+
+  // Step 1: Validate input
+  if (!longUrl) {
+    return res.status(400).json({ error: 'longUrl is required' });
+  }
+
+  if (!isValidUrl(longUrl)) {
+    return res.status(400).json({ error: 'Invalid URL format. Include http:// or https://' });
+  }
+
+  try {
+    // Step 2: Check if this long URL was already shortened
+    // Why? Don't create duplicates — return existing short URL
+    const existing = await Url.findOne({ longUrl, isActive: true });
+    if (existing) {
+      return res.status(200).json({
+        message: 'URL already shortened',
+        shortUrl: existing.shortUrl,
+        shortCode: existing.shortCode,
+        clicks: existing.clicks,
+      });
+    }
+
+    // Step 3: Generate a unique short code (handle collisions)
+    let shortCode;
+    let isUnique = false;
+    let attempts = 0;
+    const MAX_ATTEMPTS = 10;
+
+    while (!isUnique && attempts < MAX_ATTEMPTS) {
+      shortCode = generateShortCode();
+      
+      // Check if this code already exists in DB
+      const codeExists = await Url.findOne({ shortCode });
+      
+      if (!codeExists) {
+        isUnique = true;   // Found a unique code!
+      }
+      
+      attempts++;
+    }
+
+    if (!isUnique) {
+      // This should almost never happen (56 billion possibilities)
+      return res.status(500).json({ error: 'Could not generate unique code. Try again.' });
+    }
+
+    // Step 4: Calculate expiry date (if provided)
+    let expiresAt = null;
+    if (expiresInDays && expiresInDays > 0) {
+      expiresAt = new Date();
+      // Add the specified number of days
+      expiresAt.setDate(expiresAt.getDate() + parseInt(expiresInDays));
+    }
+
+    // Step 5: Build the full short URL
+    const shortUrl = `${process.env.BASE_URL}/${shortCode}`;
+
+    // Step 6: Save to MongoDB
+    const urlDoc = new Url({
+      longUrl,
+      shortCode,
+      shortUrl,
+      expiresAt,
+    });
+
+    await urlDoc.save();
+
+    // Step 7: Return the result
+    return res.status(201).json({
+      message: 'URL shortened successfully!',
+      shortUrl,
+      shortCode,
+      longUrl,
+      expiresAt,
+    });
+
+  } catch (error) {
+    console.error('Error in shortenUrl:', error);
+    return res.status(500).json({ error: 'Server error. Please try again.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// GET /:code
+// Redirects user to the original long URL
+// ─────────────────────────────────────────────────────────
+const redirectUrl = async (req, res) => {
+  const { code } = req.params;
+
+  try {
+    // Step 1: Find the URL in database
+    const urlDoc = await Url.findOne({ shortCode: code, isActive: true });
+
+    // Step 2: Handle not found
+    if (!urlDoc) {
+      return res.status(404).json({ error: 'Short URL not found or has been disabled' });
+    }
+
+    // Step 3: Check if the link has expired
+    if (urlDoc.expiresAt && new Date() > urlDoc.expiresAt) {
+      return res.status(410).json({ error: 'This link has expired' });
+      // 410 = "Gone" — resource existed but no longer does
+    }
+
+    // Step 4: Increment click counter
+    // $inc is a MongoDB operator — increments a field without reading it first
+    // This is ATOMIC — safe even if two people click at the same time
+    await Url.findByIdAndUpdate(urlDoc._id, { $inc: { clicks: 1 } });
+
+    // Step 5: Record analytics (asynchronously — don't wait for it)
+    // We don't await this because we don't want to slow down the redirect
+    recordAnalytics(code, req).catch(err => 
+      console.error('Analytics recording failed:', err)
+    );
+
+    // Step 6: Redirect!
+    // 302 = Temporary Redirect (analytics-friendly, not cached by browsers)
+    // 301 = Permanent Redirect (browsers cache it — bad for analytics!)
+    return res.redirect(302, urlDoc.longUrl);
+
+  } catch (error) {
+    console.error('Error in redirectUrl:', error);
+    return res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────
+// Helper: Record click analytics
+// ─────────────────────────────────────────────────────────
+const recordAnalytics = async (shortCode, req) => {
+  // Get IP address
+  // In production, 'x-forwarded-for' header has the real IP
+  // (when behind a proxy/load balancer)
+  const ip = req.headers['x-forwarded-for']?.split(',')[0] || 
+              req.socket.remoteAddress || 
+              'unknown';
+
+  // Lookup geo location from IP
+  const geo = geoip.lookup(ip);
+  const country = geo ? geo.country : 'Unknown';
+  const city = geo ? geo.city : 'Unknown';
+
+  // Parse User-Agent to get device info
+  const ua = req.headers['user-agent'] || '';
+  const parser = new UAParser(ua);
+  const result = parser.getResult();
+
+  // Determine device type
+  let device = 'desktop';
+  if (result.device.type === 'mobile') device = 'mobile';
+  else if (result.device.type === 'tablet') device = 'tablet';
+  else if (!result.device.type) device = 'desktop';
+  else device = 'unknown';
+
+  const browser = result.browser.name || 'unknown';
+  const os = result.os.name || 'unknown';
+  const referrer = req.headers.referer || req.headers.referrer || 'direct';
+
+  // Save analytics record
+  const analyticsDoc = new Analytics({
+    shortCode,
+    ipAddress: ip,
+    country,
+    city,
+    device,
+    browser,
+    os,
+    referrer,
+  });
+
+  await analyticsDoc.save();
+};
+
+// ─────────────────────────────────────────────────────────
+// GET /api/info/:code
+// Get info about a short URL without redirecting
+// ─────────────────────────────────────────────────────────
+const getUrlInfo = async (req, res) => {
+  const { code } = req.params;
+
+  try {
+    const urlDoc = await Url.findOne({ shortCode: code });
+
+    if (!urlDoc) {
+      return res.status(404).json({ error: 'Short URL not found' });
+    }
+
+    return res.status(200).json({
+      shortCode: urlDoc.shortCode,
+      shortUrl: urlDoc.shortUrl,
+      longUrl: urlDoc.longUrl,
+      clicks: urlDoc.clicks,
+      createdAt: urlDoc.createdAt,
+      expiresAt: urlDoc.expiresAt,
+      isActive: urlDoc.isActive,
+    });
+  } catch (error) {
+    return res.status(500).json({ error: 'Server error' });
+  }
+};
+
+module.exports = { shortenUrl, redirectUrl, getUrlInfo };
+```
+
+---
+
+## Step 3: URL Routes
+
+Create `server/routes/url.routes.js`:
+
+```javascript
+// server/routes/url.routes.js
+
+const express = require('express');
+const router = express.Router();
+const { shortenUrl, getUrlInfo } = require('../controllers/url.controller');
+
+// POST /api/shorten → Create short URL
+router.post('/shorten', shortenUrl);
+
+// GET /api/info/:code → Get URL info (no redirect)
+router.get('/info/:code', getUrlInfo);
+
+module.exports = router;
+```
+
+---
+
+## Step 4: Wire Everything in index.js
+
+Update `server/index.js`:
+
+```javascript
+// server/index.js
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const connectDB = require('./config/db');
+const urlRoutes = require('./routes/url.routes');
+const { redirectUrl } = require('./controllers/url.controller');
+
+const app = express();
+
+// Middleware
+app.use(cors());          // Allow frontend requests
+app.use(express.json());  // Parse JSON bodies
+
+// Connect to MongoDB
+connectDB();
+
+// Routes
+app.use('/api', urlRoutes);      // All /api/* routes
+
+// IMPORTANT: Redirect route — must come AFTER /api routes
+// /:code catches any short code (e.g., /aB3xYz)
+app.get('/:code', redirectUrl);
+
+// Root route
+app.get('/', (req, res) => {
+  res.json({ message: 'URL Shortener API is running! 🚀' });
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+```
+
+---
+
+## Step 5: Test with Thunder Client
+
+### Test 1: Shorten a URL
+```
+Method: POST
+URL: http://localhost:5000/api/shorten
+Body (JSON):
+{
+  "longUrl": "https://www.google.com/search?q=url+shortener+system+design",
+  "expiresInDays": 7
+}
+```
+
+**Expected Response:**
+```json
+{
+  "message": "URL shortened successfully!",
+  "shortUrl": "http://localhost:5000/aB3xYz",
+  "shortCode": "aB3xYz",
+  "longUrl": "https://www.google.com/search?q=url+shortener+system+design",
+  "expiresAt": "2026-07-02T..."
+}
+```
+
+### Test 2: Visit Short URL
+```
+Open browser → go to: http://localhost:5000/aB3xYz
+```
+You should be redirected to Google!
+
+### Test 3: Get URL Info
+```
+Method: GET
+URL: http://localhost:5000/api/info/aB3xYz
+```
+
+### Test 4: Test Invalid URL
+```
+Method: POST
+URL: http://localhost:5000/api/shorten
+Body: { "longUrl": "not-a-url" }
+```
+Should return error: "Invalid URL format"
+
+---
+
+## 301 vs 302 — Deep Dive (Interview Goldmine)
+
+| | 301 Permanent | 302 Temporary |
+|---|---|---|
+| **Browser behavior** | Caches the redirect forever | Always asks server |
+| **Analytics** | Next click goes directly to destination — server never knows | Every click hits your server — you can count them |
+| **SEO** | Passes link juice to destination | Doesn't pass link juice |
+| **When to use** | "This URL has moved permanently" | "Redirect may change" |
+
+**For URL shorteners → always use 302**
+> You want EVERY click to hit your server so you can record analytics.
+> With 301, the browser caches and never tells you about subsequent clicks.
+
+---
+
+## ✅ Phase 2 Checklist
+
+- [ ] `server/utils/shortCode.js` created (Base62 generator)
+- [ ] `server/controllers/url.controller.js` created
+- [ ] `server/routes/url.routes.js` created
+- [ ] `server/index.js` updated with routes
+- [ ] POST /api/shorten works → returns short URL
+- [ ] GET /:code redirects to long URL
+- [ ] Analytics records saved in MongoDB
+- [ ] Check MongoDB Compass — see `urls` and `analytics` collections
+
+---
+
+> [!IMPORTANT]
+> **Interview Question:** "Why 302 and not 301 for a URL shortener?"
+> Answer: "302 ensures every redirect request hits the server, allowing us to track analytics. 301 would be cached by browsers, making subsequent clicks invisible to our analytics pipeline."
+
+---
+
+**➡️ Next: Phase 3 — Redis Caching (`04_redis_caching.md`)**
