@@ -39,7 +39,7 @@ export default function Home() {
         alreadyExists: status === 200,
       })
     } catch {
-      setError('Network error — is the backend running on port 5000?')
+      setError('Network error — please try again later.')
     } finally {
       setLoading(false)
     }
