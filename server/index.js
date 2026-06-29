@@ -9,6 +9,9 @@ const analyticsRoutes = require('./routes/analytics.routes');
 const app = express();
 const {apiLimiter} = require('./middleware/rateLimiter');
 
+// Trust Render/proxy X-Forwarded-For header for correct IP detection
+app.set('trust proxy', 1);
+
 //Middleware
 const allowedOrigins = [
     'http://localhost:5173',
