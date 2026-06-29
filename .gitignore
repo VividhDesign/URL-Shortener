@@ -1,4 +1,5 @@
 node_modules/
+learn_step_by_step/
 .env
 server/.env
 client/.env
