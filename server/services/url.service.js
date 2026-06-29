@@ -13,7 +13,7 @@ const shortenUrlService = async (longUrl, expiresInDays) => {
     if (existing) {
         return {
             alreadyExists: true,
-            shortUrl: existing.shortUrl,
+            shortUrl: `${process.env.BASE_URL}/${existing.shortCode}`,
             shortCode: existing.shortCode,
             clicks: existing.clicks,
         };
