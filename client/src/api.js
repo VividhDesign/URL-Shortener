@@ -1,6 +1,7 @@
 // In production: set VITE_API_BASE to your Render backend URL in Vercel env settings
 // e.g. https://snaplink-api.onrender.com/api
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5001/api';
+// In development: Vite proxies /api → http://localhost:5001 (see vite.config.js)
+const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 
 export const shortenUrl = async (longUrl, expiresInDays) => {
   const response = await fetch(`${API_BASE}/shorten`, {
