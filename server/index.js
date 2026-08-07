@@ -23,35 +23,31 @@ const allowedOrigins = [
 
 app.use(cors({
     origin: (origin, callback) => {
-        // allow requests with no origin (Postman, curl, server-to-server)
-        if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+        if (!origin) return callback(null, true);
+        if (origin.endsWith('.vercel.app')) return callback(null, true);
+        if (allowedOrigins.includes(origin)) return callback(null, true);
         callback(new Error('Not allowed by CORS'));
     },
     credentials: true,
 }));
-app.use(express.json()); // parse JSON bodies
+app.use(express.json());
 
 connectDB();
 connectRedis();
 
-//applly general rateLimiter to all /api routes
 app.use('/api', apiLimiter);
-
 app.use('/api', urlRoutes);
-
 app.use('/api/analytics', analyticsRoutes);
-// /:code catches any short code 
 app.get('/:code', redirectUrl);
 
 app.get('/', (req, res) => {
     res.json({ message: "URL Shortener API is running" });
 });
 
-
 const PORT = process.env.PORT || 5001;
 
-// Only listen on a port if not running in a serverless environment (like Vercel)
-if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+// Skip listen only in Vercel serverless — Render still needs app.listen
+if (!process.env.VERCEL) {
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
     });
