@@ -38,8 +38,9 @@ export default function Home() {
         shortCode: data.shortCode,
         alreadyExists: status === 200,
       })
-    } catch {
-      setError('Network error — please try again later.')
+    } catch (err) {
+      console.error(err);
+      setError(`Network error: ${err.message || 'please try again later.'}`);
     } finally {
       setLoading(false)
     }
